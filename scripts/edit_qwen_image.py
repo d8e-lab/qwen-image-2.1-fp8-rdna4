@@ -75,19 +75,40 @@ def edit(args) -> int:
     log(f"{len(refs)} reference image(s): "
         + ", ".join(f"{os.path.basename(p)} {im.size}" for p, im in zip(paths, refs)))
 
-    # Resolve the output size the way the pipeline does: keep the reference's aspect
-    # ratio at roughly output_resolution**2 total area, then snap to /32.
-    target_area = (args.output_resolution or max(args.height, args.width)) ** 2
-    ratio = w0 / h0
-    import math
-    width = round(math.sqrt(target_area * ratio) / 32) * 32
-    height = round(math.sqrt(target_area / ratio) / 32) * 32
+    # ---- resolve the output size exactly as the pipeline will ----------------
+    # The pipeline keeps the LAST reference's aspect ratio at roughly
+    # output_resolution**2 of area and snaps to /32. It then re-derives the condition
+    # image sizes from the same formula, and those sizes set `img_shapes` inside the
+    # transformer. Our `image_pad_mask` must agree with that exactly, so use the
+    # pipeline's own helper rather than re-deriving the arithmetic here.
+    from diffusers.image_processor import VaeImageProcessor
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+
+    target_area = args.output_resolution ** 2
     if args.height and args.width:
         height, width = args.height, args.width
+    else:
+        width, height, _ = calculate_dimensions(target_area, w0 / h0)
     log(f"output size {width}x{height} (aspect from the last reference)")
 
+    # The condition images are resized to target_area at their own aspect ratios, and
+    # THAT is what the text encoder must see - the pipeline feeds it the resized images,
+    # not the originals. Encoding the originals produces an image_pad_mask whose token
+    # count does not match `img_shapes`, which fails deep inside the transformer with
+    # "shape mismatch: value tensor of shape [N] cannot be broadcast to indexing result".
+    proc = VaeImageProcessor(vae_scale_factor=VAE_SCALE)
+    resized_refs, ref_token_groups = [], 0
+    for im in refs:
+        iw, ih, _ = calculate_dimensions(target_area, im.size[0] / im.size[1])
+        resized_refs.append(proc.resize(im, width=iw, height=ih))
+        # one <|image_pad|> slot per 2x2 latent group
+        ref_token_groups += (iw // VAE_SCALE) * (ih // VAE_SCALE) // 4
+    log("condition images resized to "
+        + ", ".join(f"{im.size}" for im in resized_refs)
+        + f"; {ref_token_groups} image-pad slots")
+
     seq_target = (width // VAE_SCALE) * (height // VAE_SCALE)
-    seq_ref = sum((im.size[0] // VAE_SCALE) * (im.size[1] // VAE_SCALE) for im in refs)
+    seq_ref = sum((im.size[0] // VAE_SCALE) * (im.size[1] // VAE_SCALE) for im in resized_refs)
     log(f"latent tokens: {seq_ref} reference + {seq_target} target "
         f"(text-to-image would be {seq_target} alone)")
 
@@ -116,36 +137,52 @@ def edit(args) -> int:
         torch.cuda.synchronize()
         log(f"transformer resident, {torch.cuda.mem_get_info()[0]/GIB:.2f} GiB free")
 
-    # ---- encode the prompt + reference on CPU --------------------------------
-    log("\n[2/4] encoding prompt + reference (VLM) on CPU ...")
-    t0 = time.perf_counter()
-    with TextEncoderPool(model_dir, dtype) as te:
-        emb, mask, img_pad = encode_prompt(pipe, te, args.prompt, device="cpu", image=refs)
-    log(f"encoded in {time.perf_counter()-t0:.1f}s -> {tuple(emb.shape)}")
-    if img_pad is None:
-        raise SystemExit(
-            "the text encoder returned no image_pad_mask, but editing requires it: the "
-            "transformer has to know which sequence positions hold reference-image tokens."
-        )
-    n_ref_tokens = int(img_pad.sum())
-    log(f"image_pad_mask: {tuple(img_pad.shape)}, {n_ref_tokens} reference-image token slots")
-    emb = emb.to(args.device) if on_gpu else emb
-    if mask is not None:
-        mask = mask.to(args.device) if on_gpu else mask
-    img_pad = img_pad.to(args.device) if on_gpu else img_pad
-
-    neg_emb = neg_mask = neg_img_pad = None
-    if args.negative_prompt:
+    # ---- encode --------------------------------------------------------------
+    # Two strategies, selected by --self-encode:
+    #
+    #  * default (True): let the pipeline encode prompt+reference itself, during __call__.
+    #    This is the framework's supported path and gets `img_shapes` right by
+    #    construction. It needs the 16.33 GiB text encoder on the GPU, so the resident
+    #    transformer is parked in host RAM around the call.
+    #  * False: precompute embeddings on CPU (cheap, no encoder in VRAM) and pass them
+    #    in. Kept for reference, but it requires `image_pad_mask` to agree exactly with
+    #    the pipeline's internal `img_shapes`, and that geometry is easy to get wrong.
+    emb = mask = img_pad = None
+    neg_emb = neg_mask = None
+    if args.self_encode:
+        embs = None      # filled in below, after the transformer is parked
+        neg = args.negative_prompt
+        log("\n[2/4] encoding deferred to the pipeline (self-encode)")
+    else:
+        log("\n[2/4] encoding prompt + reference (VLM) on CPU ...")
+        t0 = time.perf_counter()
         with TextEncoderPool(model_dir, dtype) as te:
-            neg_emb, neg_mask, neg_img_pad = encode_prompt(
-                pipe, te, args.negative_prompt, device="cpu", image=refs)
-        if on_gpu:
-            neg_emb = neg_emb.to(args.device)
-            if neg_mask is not None:
-                neg_mask = neg_mask.to(args.device)
-            if neg_img_pad is not None:
-                neg_img_pad = neg_img_pad.to(args.device)
-    gc.collect()
+            emb, mask, img_pad = encode_prompt(
+                pipe, te, args.prompt, device="cpu", image=resized_refs)
+        log(f"encoded in {time.perf_counter()-t0:.1f}s -> {tuple(emb.shape)}")
+        if img_pad is None:
+            raise SystemExit(
+                "the text encoder returned no image_pad_mask, but editing requires it: the "
+                "transformer has to know which sequence positions hold reference-image tokens."
+            )
+        n_slots = int(img_pad.sum())
+        log(f"image_pad_mask: {tuple(img_pad.shape)}, {n_slots} image-pad slots")
+        emb = emb.to(args.device) if on_gpu else emb
+        if mask is not None:
+            mask = mask.to(args.device) if on_gpu else mask
+        img_pad = img_pad.to(args.device) if on_gpu else img_pad
+        if args.negative_prompt:
+            with TextEncoderPool(model_dir, dtype) as te:
+                neg_emb, neg_mask, _ = encode_prompt(
+                    pipe, te, args.negative_prompt, device="cpu", image=resized_refs)
+            if on_gpu:
+                neg_emb = neg_emb.to(args.device)
+                if neg_mask is not None:
+                    neg_mask = neg_mask.to(args.device)
+        gc.collect()
+        embs = dict(prompt=None, prompt_embeds=emb, prompt_embeds_mask=mask,
+                    image_pad_mask=img_pad, image=resized_refs)
+        neg = None
 
     # ---- vae ---------------------------------------------------------------
     log("\n[3/4] loading vae ...")
@@ -155,6 +192,45 @@ def edit(args) -> int:
         torch.cuda.synchronize()
     # Editing's larger sequence leaves less room, so keep tiling on.
     pipe.vae.enable_tiling()
+
+    # ---- let the pipeline do its own encoding --------------------------------
+    # Feeding precomputed prompt_embeds requires `image_pad_mask` to agree exactly with
+    # the `img_shapes` the pipeline derives internally, and that derivation is subtler
+    # than it looks: the vision encoder's patch/merge geometry decides how many
+    # <|image_pad|> slots a reference occupies, and a mismatch only surfaces deep inside
+    # the transformer as
+    #     RuntimeError: shape mismatch: value tensor of shape [N] cannot be broadcast
+    #     to indexing result of shape [M]
+    # Rather than reverse-engineer that geometry, use the pipeline's own supported path
+    # here: it encodes the prompt and the reference together itself. That needs the
+    # 16.33 GiB text encoder on the GPU, which cannot coexist with the resident
+    # transformer, so the transformer is parked in host RAM for the encode and moved
+    # back afterwards. Costs ~2x27 s of PCIe transfer; correctness first.
+    if args.self_encode:
+        log("\n[3/4] parking transformer in host RAM so the pipeline can self-encode ...")
+        t0 = time.perf_counter()
+        pipe.transformer.to("cpu")
+        gc.collect()
+        if on_gpu:
+            torch.cuda.empty_cache()
+            log(f"    parked ({torch.cuda.mem_get_info()[0]/GIB:.2f} GiB free) "
+                f"in {time.perf_counter()-t0:.1f}s")
+
+        log("    loading text encoder on the compute device ...")
+        from transformers import Qwen3VLForConditionalGeneration
+        t0 = time.perf_counter()
+        te = Qwen3VLForConditionalGeneration.from_pretrained(
+            os.path.join(model_dir, "text_encoder"), torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        ).eval()
+        te.to(args.device)
+        if on_gpu:
+            torch.cuda.synchronize()
+        pipe.text_encoder = te
+        log(f"    encoder on device in {time.perf_counter()-t0:.1f}s "
+            f"({torch.cuda.mem_get_info()[0]/GIB:.2f} GiB free)")
+        embs = dict(prompt=args.prompt, image=resized_refs)
+        neg = args.negative_prompt
 
     # ---- denoise -----------------------------------------------------------
     total_tokens = seq_ref + seq_target
@@ -173,13 +249,9 @@ def edit(args) -> int:
     t0 = time.perf_counter()
     with torch.no_grad():
         out = pipe(
-            prompt=None,
-            prompt_embeds=emb,
-            prompt_embeds_mask=mask,
-            image_pad_mask=img_pad,
-            negative_prompt_embeds=neg_emb,
-            negative_prompt_embeds_mask=neg_mask,
-            image=refs,                      # consumed by the VAE path
+            negative_prompt=neg,
+            negative_prompt_embeds=None if neg is not None else neg_emb,
+            negative_prompt_embeds_mask=None if neg is not None else neg_mask,
             true_cfg_scale=args.guidance,
             height=height,
             width=width,
@@ -187,6 +259,15 @@ def edit(args) -> int:
             generator=gen,
             use_kv_cache=use_kv,
             output_type="pil",
+            # MUST be passed. The pipeline re-derives the condition-image sizes from
+            # `output_resolution` (default 1024) rather than from `height`/`width`, and
+            # those sizes set `img_shapes` inside the transformer. Omitting it makes the
+            # transformer build a sequence for a 1024-class latent grid while we denoise
+            # a 512-class one, which fails deep inside as
+            #     shape mismatch: value tensor of shape [N] cannot be broadcast to
+            #     indexing result of shape [M]
+            output_resolution=args.output_resolution,
+            **embs,
         )
     if on_gpu:
         torch.cuda.synchronize()
@@ -228,6 +309,11 @@ def main() -> int:
                     choices=["auto", "bfloat16", "float16", "float32"])
     ap.add_argument("--quantize", default="fp8", choices=["fp8", "none"])
     ap.add_argument("--kv-cache", default="auto", choices=["auto", "on", "off"])
+    ap.add_argument("--self-encode", action=argparse.BooleanOptionalAction, default=False,
+                    help="let the pipeline encode prompt+reference itself. Default OFF: it "
+                         "needs the 16.33 GiB text encoder on the GPU, which does not fit "
+                         "alongside anything else in 16 GB (measured: allocates 15.10 GiB "
+                         "and OOMs). The default instead precomputes embeddings on CPU.")
     args = ap.parse_args()
     return edit(args)
 
