@@ -1,0 +1,35 @@
+# Environment / heavyweight artifacts (reproducible, never commit)
+pylibs/
+diffusers-src/
+tiny_model/
+logs/
+*.log
+
+# Model weights live outside the repo (see README)
+models/
+*.safetensors
+*.gguf
+
+# Generated outputs
+out*.png
+edit_*.png
+conf_check.png
+verify_*.png
+
+# Private scratch material (local prompt tests, not part of the project)
+prompts/
+run.sh
+demo_bookshop.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
