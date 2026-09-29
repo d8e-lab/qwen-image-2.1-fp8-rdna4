@@ -5,6 +5,11 @@ tiny_model/
 logs/
 *.log
 
+# ...but the patches applied to diffusers-src ARE tracked (see patches/README.md),
+# because diffusers-src itself is a throwaway clone.
+!patches/
+!patches/**
+
 # Model weights live outside the repo (see README)
 models/
 *.safetensors

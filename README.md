@@ -172,6 +172,18 @@ So transformers 5.17 + hub 1.33 live in `./pylibs` and `diffusers-src/`, shadowi
 installed versions, while the ~3 GB ROCm torch wheel is reused rather than re-downloaded.
 Set `QIP_VENV` to point at your own torch install.
 
+### Apply the diffusers patch
+
+`diffusers-src/` is a clone of upstream and is git-ignored, so the one edit this project
+needs is kept as a real patch instead. Without it, image editing with precomputed
+embeddings is **impossible** (the pipeline has no way to receive `image_pad_mask`):
+
+```bash
+cd diffusers-src && git apply ../patches/0001-qwenimage21-image-pad-mask.patch && cd ..
+```
+
+See [`patches/README.md`](patches/README.md) for the full diagnosis.
+
 ### Model weights (33.12 GB)
 
 ```bash

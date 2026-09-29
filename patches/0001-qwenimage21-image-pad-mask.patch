@@ -1,0 +1,20 @@
+diff --git a/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py b/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py
+index 786b09b..6bae03f 100644
+--- a/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py
++++ b/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py
+@@ -517,6 +517,7 @@ class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
+         latents: torch.Tensor | None = None,
+         prompt_embeds: torch.Tensor | None = None,
+         prompt_embeds_mask: torch.Tensor | None = None,
++        image_pad_mask: torch.Tensor | None = None,
+         negative_prompt_embeds: torch.Tensor | None = None,
+         negative_prompt_embeds_mask: torch.Tensor | None = None,
+         output_type: str | None = "pil",
+@@ -682,6 +683,7 @@ class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
+             prompt=prompt,
+             prompt_embeds=prompt_embeds,
+             prompt_embeds_mask=prompt_embeds_mask,
++            image_pad_mask=image_pad_mask,
+             device=device,
+             num_images_per_prompt=num_images_per_prompt,
+         )

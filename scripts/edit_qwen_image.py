@@ -120,21 +120,31 @@ def edit(args) -> int:
     log("\n[2/4] encoding prompt + reference (VLM) on CPU ...")
     t0 = time.perf_counter()
     with TextEncoderPool(model_dir, dtype) as te:
-        emb, mask, _ = encode_prompt(pipe, te, args.prompt, device="cpu", image=refs)
+        emb, mask, img_pad = encode_prompt(pipe, te, args.prompt, device="cpu", image=refs)
     log(f"encoded in {time.perf_counter()-t0:.1f}s -> {tuple(emb.shape)}")
+    if img_pad is None:
+        raise SystemExit(
+            "the text encoder returned no image_pad_mask, but editing requires it: the "
+            "transformer has to know which sequence positions hold reference-image tokens."
+        )
+    n_ref_tokens = int(img_pad.sum())
+    log(f"image_pad_mask: {tuple(img_pad.shape)}, {n_ref_tokens} reference-image token slots")
     emb = emb.to(args.device) if on_gpu else emb
     if mask is not None:
         mask = mask.to(args.device) if on_gpu else mask
+    img_pad = img_pad.to(args.device) if on_gpu else img_pad
 
-    neg_emb = neg_mask = None
+    neg_emb = neg_mask = neg_img_pad = None
     if args.negative_prompt:
         with TextEncoderPool(model_dir, dtype) as te:
-            neg_emb, neg_mask, _ = encode_prompt(
+            neg_emb, neg_mask, neg_img_pad = encode_prompt(
                 pipe, te, args.negative_prompt, device="cpu", image=refs)
         if on_gpu:
             neg_emb = neg_emb.to(args.device)
             if neg_mask is not None:
                 neg_mask = neg_mask.to(args.device)
+            if neg_img_pad is not None:
+                neg_img_pad = neg_img_pad.to(args.device)
     gc.collect()
 
     # ---- vae ---------------------------------------------------------------
@@ -166,6 +176,7 @@ def edit(args) -> int:
             prompt=None,
             prompt_embeds=emb,
             prompt_embeds_mask=mask,
+            image_pad_mask=img_pad,
             negative_prompt_embeds=neg_emb,
             negative_prompt_embeds_mask=neg_mask,
             image=refs,                      # consumed by the VAE path
