@@ -1112,3 +1112,293 @@ returned the first `data:` chunk instead of waiting for `event: complete`. The s
 showed the generations had actually run fine. Worth remembering that a wrong-looking
 measurement should be checked against the server's own log before it is believed.
 
+
+---
+
+# PART 3: the prompt rewriter (Qwen-Image-2.1-PE-T2I)
+
+## 34. What the "PE" model actually is
+
+`Qwen/Qwen-Image-2.1-PE-T2I` is **not** an image model and not a second image model. It is
+the prompt planner that ships next to Qwen-Image-2.1: a fine-tuned Qwen3.5-VL that turns a
+brief request in any language into the long English prompt the image model prefers, plus a
+recommended aspect ratio. Architecture, read from the downloaded config:
+
+| | |
+|---|---|
+| params / size | 9.41B, **18.84 GiB in BF16**, four shards |
+| text stack | 32 layers, hidden 4096, vocab 248320, max_position 262144 |
+| attention | **hybrid**: 8 full-attention layers (`full_attention_interval=4`, head_dim 256, 4 KV heads) + 24 linear-attention (`Qwen3_5GatedDeltaNet`) |
+| vision tower | 333 `model.visual.*` tensors in the checkpoint, ignored by `AutoModelForCausalLM` (`Qwen3_5ForCausalLM`) - text-only rewriting does not need them |
+| system prompt | 2426 tokens, an 8-step "Image Prompt Rewriting Expert" recipe |
+| output | `<think>...</think>` then **one line of JSON**: `{"rewritten_prompt": "...", "wh_ratio": "3:2"}` |
+
+Two things that come straight from the system prompt and are worth not fighting: the
+description is **always English** whatever language the request arrives in, and the render
+ratio lives **only** in `wh_ratio` - it must never appear inside the description text.
+
+Because the hybrid stack only has 8 full-attention layers, the KV cache is cheap:
+8 x 4 x 256 x 2 (k,v) x 2 bytes = 32 KiB/token, i.e. ~128 MiB for a 4096-token answer. The
+binding constraint is therefore the **weights**, not the cache - which is also why the
+`--max-new-tokens` budget is about time, not memory.
+
+### Why it runs on CPU, in its own process
+
+18.84 GiB of BF16 cannot be resident in 15.82 GiB of VRAM, and it must never share VRAM with
+the fp8 transformer either (6.63 GiB resident). Meanwhile host RAM is ~21 GiB available, and
+the image model's own staging needs 13.25 GiB (bf16 transformer) and 16.33 GiB (text encoder)
+at different times. So the rewriter is staged exactly like the text encoder: load, rewrite,
+free. `scripts/run_two_stage.py` puts stage 2 in a **subprocess** rather than `del`-ing the
+rewriter in-process, because process exit is the only unambiguous way to hand ~19 GiB back.
+
+`scripts/pe_rewrite.py` is the reusable half (load / generate / parse), `run_two_stage.py` is
+the driver that then calls `run_qwen_image.py`.
+
+### Resolution: the card's advice does not fit this box
+
+The card recommends 2048x2048 up to 2752x1536 - 4x the pixels of a 1024x1024 run, i.e.
+roughly 4x the attention KV cache and activation peak that already reach ~10.3 GiB of ~14 GiB
+free here. So the *ratio* is honoured and the *area* is budgeted: the longest side is
+`--max-side` (default 1024) and the short side follows the ratio, rounded to /16
+(`16:9 -> 1024x576`, `2:3 -> 688x1024`, `1:1 -> 1024x1024`).
+
+### Downloading it: `fast_download.py` fetched files sequentially
+
+The script shared the connection budget across files (`--workers // len(files)`) but then
+downloaded the files one after another, so only `per_file` connections were ever in flight:
+measured **0.9 MB/s** with 5 files and 4 streams. Fetching the files concurrently (one thread
+per file, each with its own range pool) is what the docstring always claimed to do; after the
+fix the same link did **~6-7 MB/s** aggregate for this 18.84 GB repo. `scripts/download_pe.sh`
+wraps both passes (shards via `fast_download.py`, small files via `snapshot_download`).
+
+Note the model lives in `./models/` **inside this repo**, not in `~/workspace/models`: only the
+session workspace is mounted read-write in this environment, and `~/workspace/models` is EROFS
+from here. `.gitignore` already covers `models/`.
+
+### The GPU "failure" was a sandbox artefact
+
+`qip_gpu_ok` reported `GPU UNUSABLE` / `No CUDA GPUs are available` while `/dev/dxg` did not
+exist at all. The GPU was fine: the process sandbox mounts a **synthetic minimal `/dev`**
+(6-8 entries: null, zero, random, urandom, tty, full, pts, shm), so the device node is simply
+invisible, and `/sys` - which comes from the host - still showed `/sys/class/misc/dxg` at
+10:258. Under a policy that exposes the real `/dev`, the identical command prints
+`GPU OK - allocations work`. See GPU_RECOVERY_NEEDED.md step 0 before rebooting anything.
+
+### Measured, end to end (first real two-stage run)
+
+| stage | measurement |
+|---|---|
+| download | 18.84 GB; first pass 54 min, one shard failed sha256 and was re-fetched separately (7-10 MB/s with 32 range streams once the files were fetched concurrently) |
+| load, bf16 on CPU (warm page cache) | 1.5 s; **8.95B** text params, **16.68 GiB** (vision tower dropped) |
+| quantise 248 linears -> fp8 | 27-33 s; model 10.24 GiB |
+| move the fp8 model to the GPU | 48-54 s; **10.31 GiB resident, ~2.1 GiB left** |
+| one GPU forward, fp8 | 4.7 s @32 tok, 3.0 @128, 3.6 @512, 4.4 @1024, 6.2 @2048 - **flat in length** |
+| GPU prefill, full 2426-token system prompt | **never completed**: `dxgkio_create_allocation: Ioctl failed: -12` (ENOMEM) |
+| CPU prefill, 2451 tokens | ~7 min |
+| CPU decode | ~3.7 s/token (**0.27 tok/s**) |
+| full rewrite, `--no-thinking` | **399 tokens in 1917 s (32 min)** |
+| stage 2 render, 1024x688 (3:2), 20 steps, guidance 1.0 | denoise 126.6 s (6.33 s/step), text encode 25.6 s on CPU, VAE 1.4 s, **230.5 s total** |
+
+The rewritten prompt was accurate enough that the render matches it point by point - fur
+markings, guitar material, rain streaks, pavement reflections, bokeh lamps - and it chose
+`3:2` for a horizontal subject, exactly as its system prompt's step 2 instructs. Output:
+`pe_corgi.png`, 1024x672 RGBA (the pipeline rounds the 688-side down to a multiple of 32).
+
+Two numbers worth flagging:
+
+* **6.33 s/step here against 3.44 s/step in section 29** for the same transformer. The
+  difference is the prompt: `prompt_embeds` is 391 tokens here versus a short prompt there, and
+  the joint text+image attention pays for it. A good rewrite is a long prompt, and a long
+  prompt is not free - budged for ~2x the per-step cost when planning a run.
+* `--no-thinking` is what made the rewrite 32 min instead of 1.5-2 h. The card's defaults
+  (`enable_thinking=True`, `max_new_tokens=16256`) assume a GPU that can do ~20 tok/s; on CPU
+  the thinking budget, not the JSON, dominates. Cache the result (`--reuse-rw`) and re-render
+  instead of re-rewriting.
+
+## 35. The full-tensor transpose is ~30x slower than a blocked one
+
+Chasing why the fp8 rewriter was slow on the GPU (section 34) turned up a general problem in
+`Fp8Weight.dequantize_transposed`: the `.t().contiguous()` that materialises the contiguous
+(in, out) weight - the layout every fast matmul depends on - runs at a fraction of memory
+bandwidth on this stack. 12288x4096 bf16, 96 MiB:
+
+| operation | time | effective |
+|---|---|---|
+| `clone()` (already contiguous) | 0.36 ms | ~260 GB/s |
+| `.t().contiguous()` | **24.9 ms** | **~8 GB/s** |
+| `permute(1,0).contiguous()` | 29.6 ms | ~6 GB/s |
+| blocked transpose, 256 rows | **0.84 ms** | ~114 GB/s |
+
+It is not a bf16 quirk: fp16 costs the same 29.6 ms, and fp32 is proportionally worse
+(75.5 ms for the 192 MiB version - ~5 GB/s). The cause is that a 2-D transpose falls into the
+generic elementwise copy kernel: one 2-byte element per thread with a source stride of
+12288*2 B, so a 32-thread warp touches 32 different rows and every fetched 32 B sector yields
+about 2 useful bytes. Copying the transpose in blocks of rows keeps each block's source rows
+contiguous, and then the copy kernel coalesces.
+
+**Fix** (in `fp8_quant.dequantize_transposed`): build the (out, in) tensor as before, then fill
+the (in, out) destination 256 rows at a time. Verified bit-identical across 2 devices x 3
+dtypes x 5 shapes, including sizes that are not multiples of the block, and an end-to-end
+render reproduced `pe_corgi.png` **byte for byte** (same sha256).
+
+Measured effect:
+
+| | before | after |
+|---|---|---|
+| `Fp8Weight.forward`, 12288x4096 layer | 31.5 ms | **2.73 ms** (11.7x) |
+| denoise step, 1024x672, 391-token prompt | 6.33 s | **4.26 s** (1.49x) |
+| denoise step, 1024x1024, short prompt, back-to-back A/B | 8.80 s | **6.91 s** (1.27x) |
+
+The per-step gain is smaller than the per-layer one because `dequantize_transposed` is not the
+whole step - attention, VAE and the rest are unaffected.
+
+Two things this does **not** fix:
+
+* **The rewriter on the GPU stays pointless.** Its per-forward cost went from 3.6/6.2 s
+  (512/2048 tokens) to 3.6/3.9 s - i.e. barely moved. What remains is ~14 ms per layer of
+  Python and kernel-launch overhead around the `causal_conv1d` and
+  `fused_recurrent_gated_delta_rule` *reference* implementations that transformers falls back
+  to when `flash-linear-attention` is absent. So section 34's conclusion (CPU for the rewriter)
+  stands, but the reason is the hybrid attention stack, not the fp8 dequantisation.
+* **Absolute step times are machine-state dependent.** The 3.44 s/step recorded in section 29
+  for the same 1024x1024/40-step workload could not be reproduced in this session: the same
+  code ran 6.14 s/step hours later, and the back-to-back A/B above ran 6.91-8.80 s/step. Same
+  shard, same code, same seed. `scripts/check_throttle.py` - the probe written for exactly this
+  question - now times out instead of reporting, and WSL exposes no hwmon/clock nodes to check
+  the card directly. Treat the old 3.44 s/step as a cool-machine number, and treat the A/B
+  *ratios* above as the trustworthy part: they were measured minutes apart on identical input.
+
+## 36. Re-testing the "1000x" layout claim: it depends on `ROCBLAS_USE_HIPBLASLT`
+
+Section 25 recorded a weight-layout penalty of ~825-1000x (`x @ W.t()` 1010 ms vs `x @ Wt`
+1.22 ms). Re-running the same shape (12288x4096 bf16, x of 1..4096 rows) in this session did
+**not** reproduce that - until the env flag was flipped back:
+
+| `ROCBLAS_USE_HIPBLASLT` | B=1 `x @ W.t()` | B=1 `x @ Wt` | B=1024 `x @ W.t()` | B=1024 `x @ Wt` |
+|---|---|---|---|---|
+| **0** (what `env.sh` sets) | 2.44 ms | 0.32 ms (**7.6x**) | 9.78 ms | 9.44 ms (**1.0x**) |
+| **1** (the default) | 954 ms | 0.18 ms (**5181x**) | 936 ms | 1.02 ms (**915x**) |
+
+So the 1000x is real, but it belongs to the **hipBLASLt failed-kernel path** (the log fills with
+`hipModuleLoad failed ... error: named symbol not found` / `no kernel image is available`),
+not to weight layout per se. `env.sh`'s `ROCBLAS_USE_HIPBLASLT=0` is what turns a 5000x cliff
+into a 7.6x penalty. AGENTS.md rule 1 says the flag "changes nothing measurable" - that was
+measured with a **contiguous** weight, where it is true (122.6 vs 122.9 TFLOP/s); with a
+*transposed* weight the flag is worth ~400x.
+
+Practical consequence: the rule "materialise a contiguous (in, out) weight" still stands, but
+its size depends on the regime:
+
+* batch=1 (LLM decode, single-token steps): transposed view is 7.6x slower, so paying the
+  0.84 ms blocked transpose to save 2.1 ms is worth it (2.4 ms -> 1.17 ms).
+* batch>=128 (image denoise: 4096 tokens): transposed view is only ~1.0-1.1x slower, i.e. the
+  transpose is a wash - it costs 0.84 ms and saves ~10% of a 10 ms GEMM.
+* with hipBLASLt enabled nothing is worth anything: the transposed path is catastrophic at
+  every batch size, which is exactly why the flag is pinned in `env.sh`.
+
+## 37. Putting the rewriter on the GPU: three attempts, none of them wins on 15.82 GiB
+
+Section 34 concluded "CPU for the rewriter". This is the full record of trying to beat that,
+so the next person (or the next session) does not repeat it.
+
+| attempt | outcome |
+|---|---|
+| **bf16, whole model on GPU** | 16.68 GiB of weights into ~13.6 GiB free. Does not fit, no experiment needed. |
+| **fp8, whole model on GPU** (`--device cuda --quantize fp8`) | Fits: 248 linears quantised in 27-33 s to 10.24 GiB, 10.33 GiB resident, ~2.5-3.6 GiB left. Two problems: (a) the 2426-token system-prompt prefill never completed - `dxgkio_create_allocation: Ioctl failed: -12` (ENOMEM) hundreds of times in `dmesg`; (b) even when a forward fits, it costs 1.2-3.8 s and is roughly **flat in sequence length** (32/512/2048 tokens all in the same band), i.e. it is per-layer overhead, not compute - about the same as the CPU path's 3.75 s/token. |
+| **bf16 hybrid** (`--device cuda --quantize none`, accelerate `device_map="auto"`) | `max_memory={0: "11GiB", "cpu": "19GiB"}` loads in 45 s and splits **8.75 GiB on cuda:0, 7.93 GiB on `meta`** - transformers 5.17 lazy-offloads the CPU part ("Some parameters are on the meta device because they were offloaded to the cpu") and streams it per forward. Prefill was still running after 7 minutes (>1.5x the CPU path's ~7 min was already certain) and was killed. |
+
+The hybrid attempt is the instructive one: the split is roughly 4B params on GPU and 4B on CPU,
+and a sequential transformer runs *every* layer for *every* token, so the slowest device sets
+the pace. Prefill cost is dominated by the CPU-resident half (same ~6 tok/s as full CPU), and
+decode would have gained at most ~2x - not the 4-5x that motivated the attempt.
+
+What would actually work, in order of effort:
+
+1. **Fewer output tokens.** The rewrite is 399 tokens at `--no-thinking`; `--max-new-tokens`
+   caps it, and the JSON answer needs ~350-450. This is the only knob available today.
+2. **Cache the rewrite** (`--reuse-rw`), so the 32 minutes is paid once per idea rather than
+   once per image.
+3. **A GPU with >17 GiB**, where bf16 fits and the whole model runs at ~20-30 tok/s.
+4. **int4 weights** (8.95B -> ~4.6 GiB) would fit comfortably, but there is no int4 GEMM path
+   in this stack either; fp8 already showed that slow dequantisation outweighs the size win.
+
+## 38. Persisting the fp8 weights (and why `save_pretrained` cannot do it)
+
+Quantising the 232 image-transformer Linears costs **40.9 s** of CPU on every run. The result
+is only 6.63 GiB and never changes, so it belongs on disk - and `save_pretrained` cannot write
+it, for the reason recorded in section 8/phase 1: `Fp8Weight` keeps `qweight`/`scale`/`bias` in
+**non-persistent** buffers and is not an `nn.Linear`, so the checkpoint would contain only the
+empty bf16 placeholders. Reloading that writes an empty `nn.Linear` over every quantised layer -
+the exact failure an earlier revision hit.
+
+`scripts/fp8_checkpoint.py` serialises the payload itself:
+
+    <cache>/fp8_weights.safetensors   "<module.path>.qweight" (uint8), ".scale" (fp32), ".bias"
+    <cache>/fp8_manifest.json         version, per-module (in, out, has_bias), quantise settings,
+                                      and a cheap source fingerprint
+
+Loading walks the manifest, checks each target is still an `nn.Linear` of the recorded shape,
+and swaps in an `Fp8Weight` holding the bytes. Two guards, because a *wrong* cache is much
+worse than no cache: the settings must match (`min_params`, per-row scaling) and the source
+fingerprint (transformer config + shard sizes) must match the checkpoint on disk. Any failure
+is caught in `run_qwen_image.py` and degraded to "re-quantise".
+
+Measured, 512x512 / 4 steps, same seed, back to back:
+
+| | quantise + save | cache hit |
+|---|---|---|
+| fp8 stage | 40.9 s (+5.5 s to write 6.63 GiB) | **2.0 s** (3.39 GiB/s) |
+| total wall | 109.1 s | **83.4 s** |
+| output | `out_ckpt_a.png` | `out_ckpt_b.png`, **identical md5** (`f41695a1...`) |
+
+The identical image is the point: the cache is a byte-exact copy of what quantisation produced,
+not a second quantisation. Round-trip and both guards are covered by a direct unit check
+(2-layer dummy module, wrong settings -> `ValueError`, wrong checkpoint -> `ValueError`).
+
+Where the cache lives: `<model>/fp8-cache` by default (`--fp8-cache DIR` to move it,
+`--no-fp8-cache` to bypass). Note this writes *next to the model*, so it needs that directory
+to be writable; a failure there is logged and ignored rather than fatal.
+
+## 39. Why fp8 GEMM is impossible here: hipBLASLt's CCOB libraries never load
+
+Chasing the `HIPBLAS_STATUS_INTERNAL_ERROR` from `torch._scaled_mm` (section 34) to its root.
+The short version: **the fp8 path has no working kernel because hipBLASLt's per-solution
+libraries cannot be loaded at all on this system**, and fp8 is the only data type with no
+rocBLAS fallback.
+
+Evidence, in the order it was gathered:
+
+1. `TENSILE_DB=0xffff` shows the solution is selected (`Solution index selected: 124920`), so
+   the PCI-chip-ID predicates added in 7.13 are **not** the problem.
+2. The load of `TensileLibrary_F8F8_BF8_..._gfx1201.co` fails:
+   `error: no kernel image is available for execution on the device`, the `-xnack±` variants do
+   not exist, and the subsequent `getKernel` fails with `named symbol not found`.
+3. Those `.co` files are CCOB v3.1 containers: CCOB header -> zstd frame at offset 32 ->
+   `__CLANG_OFFLOAD_BUNDLE__` -> `hipv4-amdgcn-amd-amdhsa--gfx1201`, 66 MB, ELF ET_DYN,
+   EM_AMDGPU 224, `e_flags 0x4e (gfx1201)`. The packaging is intact.
+4. **A/B with the same toolchain**: `clang-23` (from the same 7.14.0 wheel) compiling and
+   `ld.lld -shared` linking a trivial kernel for gfx1201 produces an object that
+   `hipModuleLoad` accepts (`rc=0`). The CCOB payload returns `rc=209`
+   (`hipErrorNoBinaryForGpu`).
+5. Two plausible defects were tested and **both were rejected**:
+   * the payload's `NT_AMDGPU_METADATA` has no `amdhsa.target` (a local build has it) - injected
+     the key into the msgpack note with `llvm-objcopy --update-section`, still rc=209;
+   * the payload's ELF says `EI_ABIVERSION 2` while a local build says 4 - patched the byte to
+     3 and 4, still rc=209.
+6. It is not fp8-specific: with `ROCBLAS_USE_HIPBLASLT=1`, a **bf16** matmul also fails to load
+   its CCOB library (`hipModuleLoad failed: TensileLibrary_BB_...`) and only completes through
+   the plain `Kernels.so-000-gfx1201.hsaco` fallback - which is the ~1000x slowdown recorded in
+   section 25. bf16 normally avoids all of this because `ROCBLAS_USE_HIPBLASLT=0` routes it to
+   rocBLAS, whose libraries are plain `.hsaco` and load fine.
+
+So the ordering is: rocBLAS hsaco -> works; hipBLASLt CCOB -> never loads; hsaco fallback ->
+loads but has no fp8 kernels. fp8 therefore has nowhere to go.
+
+Consequences:
+
+* fp8 compute on this box is not a matter of flags or of patching our own code; it needs a
+  fixed hipBLASLt/Tensile packaging (or a loader fix) from AMD.
+* The practical low-precision path remains int8 (`torch._int_mm`), which is a plain kernel and
+  works: 0.120 ms vs 8.97 ms bf16 at B=1024 for one 12288x4096 layer (16x).
+* The issue text, with the full evidence chain and the two rejected hypotheses, is in
+  `ISSUE_gfx1201_hipblaslt_fp8.md` - ready to file against `ROCm/TheRock`.

@@ -275,7 +275,23 @@ def main() -> int:
     ap.add_argument("--only", default=None, help="substring filter on filenames")
     ap.add_argument("--min-size", type=float, default=0.05, help="only files bigger than this (GB)")
     ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--repo", default=None,
+                    help="Hub repo id (default: the Qwen-Image-2.1 image model)")
+    ap.add_argument("--dest", default=None,
+                    help="local dir (default: ~/workspace/models/<repo>)")
     args = ap.parse_args()
+
+    # The globals are also read by seed_is_valid/cached_blobs/download_file, so they are
+    # rebound here rather than threaded through every call.
+    global REPO, DEST, CACHE, API, RESOLVE
+    if args.repo:
+        REPO = args.repo
+    DEST = os.path.expanduser(args.dest) if args.dest else os.path.join(
+        os.path.expanduser("~/workspace/models"), REPO)
+    CACHE = os.path.join(DEST, ".cache", "huggingface", "download")
+    API = f"https://huggingface.co/api/models/{REPO}?blobs=true"
+    RESOLVE = f"https://huggingface.co/{REPO}/resolve/main"
+    log(f"repo {REPO}\n  -> {DEST}")
 
     session = build_session()
     blobs = list_blobs(session)
@@ -298,13 +314,22 @@ def main() -> int:
 
     # Share the connection budget across files so each gets several streams.
     per_file = max(4, args.workers // max(1, len(big)))
-    log(f"using {per_file} connections per file\n")
+    log(f"using {per_file} connections per file, {len(big)} files in flight\n")
 
     t0 = time.time()
     failed = []
-    for b in big:
-        if not download_file(b, session, workers=per_file, verify=not args.no_verify):
-            failed.append(b["rfilename"])
+    # Files run CONCURRENTLY. download_file() only opens `per_file` range streams, so a
+    # sequential loop burns `per_file` of the `--workers` budget and leaves most of the
+    # link idle - measured on this box: 0.9 MB/s sequential vs 7-10 MB/s with all files
+    # in flight. Ranges within a file still resume and verify independently.
+    def one_file(b: dict) -> tuple[str, bool]:
+        ok = download_file(b, session, workers=per_file, verify=not args.no_verify)
+        return b["rfilename"], ok
+
+    with cf.ThreadPoolExecutor(max_workers=len(big)) as ex:
+        for rel, ok in ex.map(one_file, big):
+            if not ok:
+                failed.append(rel)
     log(f"\ntotal {time.time()-t0:.1f}s")
     if failed:
         log("FAILED: " + ", ".join(failed))

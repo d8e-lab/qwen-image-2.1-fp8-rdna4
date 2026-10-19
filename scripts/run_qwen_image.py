@@ -44,6 +44,7 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fp8_checkpoint  # noqa: E402
 from fp8_quant import fp8_memory_summary, quantize_linears_  # noqa: E402
 
 GIB = 2**30
@@ -112,6 +113,11 @@ def main() -> int:
     ap.add_argument("--fp8-cache-dequant", action="store_true",
                     help="cache dequantised bf16 weights. Measured ~2x faster "
                          "(36.5 -> 18.4 s/step on CPU) but needs ~13 GiB more RAM/VRAM")
+    ap.add_argument("--fp8-cache", default=None,
+                    help="where the quantised fp8 weights are cached "
+                         "(default: <model>/fp8-cache). Reusing it skips the ~35 s quantise")
+    ap.add_argument("--no-fp8-cache", action="store_true",
+                    help="always quantise; never read or write the fp8 cache")
     ap.add_argument("--kv-cache", default="auto", choices=["auto", "on", "off"])
     ap.add_argument("--vae-tiling", action="store_true",
                     help="lower VAE decode peak VRAM (auto-enabled on GPU >=768px)")
@@ -213,26 +219,51 @@ def main() -> int:
             args.fp8_cache_dequant = False
 
     if args.quantize == "fp8":
-        log("\n      quantising transformer Linears -> fp8_e4m3fn (per-row scales) ...")
-        t0 = time.perf_counter()
-        report = quantize_linears_(transformer, cache_dequant=args.fp8_cache_dequant,
-                                   min_params=args.quant_min_params)
-        log(f"      {report['converted']} layers quantised, {report['skipped']} skipped, "
-            f"in {time.perf_counter()-t0:.1f}s")
-        log(f"      Linear weights: {report['orig_bytes']/GIB:.2f} GiB -> {report['fp8_bytes']/GIB:.2f} GiB")
+        # The quantised weights are persisted (scripts/fp8_checkpoint.py) because quantising
+        # 232 layers costs 34-37 s of CPU on every single run, while reading the same 6.63 GiB
+        # back from disk costs ~4 s. The cache stores the fp8 payload only - the bf16
+        # checkpoint's own save_pretrained cannot represent it (see the note below).
+        cache_dir = None
+        if not args.no_fp8_cache:
+            cache_dir = args.fp8_cache or os.path.join(args.model, "fp8-cache")
+        settings = {"min_params": args.quant_min_params, "per_row": True}
+        loaded_from_cache = False
+        if cache_dir and fp8_checkpoint.exists(cache_dir):
+            try:
+                info = fp8_checkpoint.load_fp8(
+                    transformer, cache_dir, model_dir=args.model,
+                    cache_dequant=args.fp8_cache_dequant, settings=settings)
+                loaded_from_cache = True
+                log(f"\n      fp8 weights restored from {cache_dir} "
+                    f"({info['seconds']:.1f}s instead of re-quantising)")
+            except Exception as exc:  # stale/wrong cache must never be fatal
+                log(f"\n      fp8 cache unusable ({type(exc).__name__}: {exc}); re-quantising")
+        if not loaded_from_cache:
+            log("\n      quantising transformer Linears -> fp8_e4m3fn (per-row scales) ...")
+            t0 = time.perf_counter()
+            report = quantize_linears_(transformer, cache_dequant=args.fp8_cache_dequant,
+                                       min_params=args.quant_min_params)
+            log(f"      {report['converted']} layers quantised, {report['skipped']} skipped, "
+                f"in {time.perf_counter()-t0:.1f}s")
+            log(f"      Linear weights: {report['orig_bytes']/GIB:.2f} GiB -> {report['fp8_bytes']/GIB:.2f} GiB")
+            if cache_dir:
+                try:
+                    fp8_checkpoint.save_fp8(transformer, cache_dir, model_dir=args.model,
+                                            settings=settings)
+                except Exception as exc:
+                    log(f"      could not write fp8 cache: {type(exc).__name__}: {exc}")
         gc.collect()
         summary = fp8_memory_summary(transformer)
         log(f"      transformer resident now: {summary['total_GiB']:.2f} GiB "
             f"({summary['fp8_layers']} fp8 layers + {summary['other_params']} other tensors)")
 
-        # NOTE: do NOT try to save_pretrained/reload the quantised module as a way to
-        # release host RAM. Fp8Weight keeps its bytes in *non-persistent* buffers, so
-        # save_pretrained would emit only the fp32/bf16-shaped placeholders and the
-        # reload would silently reconstruct empty nn.Linear layers (this is exactly
-        # what an earlier version of this script did, and the layer-count assertion
-        # below is what caught it). Keeping the quantised module in place is correct:
-        # staged component loading already bounds host RAM.
-        summary = fp8_memory_summary(transformer)
+        # NOTE: do NOT use save_pretrained to persist this module. Fp8Weight keeps its
+        # bytes in *non-persistent* buffers and is not an nn.Linear, so save_pretrained
+        # emits only the fp32/bf16-shaped placeholders and a reload would silently
+        # reconstruct empty nn.Linear layers (an earlier revision did exactly that; the
+        # layer-count assertion caught it). fp8_checkpoint.py above is the supported
+        # persistence path. Keeping the quantised module in place is also correct for RAM:
+        # staged component loading already bounds host usage.
     else:
         summary = {"total_GiB": sum(p.numel() * p.element_size()
                                     for p in transformer.parameters()) / GIB}

@@ -2,10 +2,13 @@
 
 Running the 7.1 B Qwen-Image-2.1 diffusion transformer on a 16 GB consumer Radeon under
 WSL2 + ROCm, using FP8 as a **weight storage** format. Generates 1024×1024 images in
-**~138 s (40 steps, 3.44 s/step)** — and text-to-image works today.
+**~138 s (40 steps, 3.44 s/step)** on a cool machine — a long session can be ~2× slower, see
+NOTES.md §35 — and text-to-image works today. The official prompt
+planner (`Qwen-Image-2.1-PE-T2I`, a 9B Qwen3.5-VL) is wired in as an optional first stage, so
+a one-line request in any language becomes a detailed English prompt and then an image.
 
 Everything here was measured on the target machine. The non-obvious findings are written
-down in [`NOTES.md`](NOTES.md) (33 sections) rather than left as folklore, including four
+down in [`NOTES.md`](NOTES.md) (38 sections) rather than left as folklore, including five
 occasions where an earlier conclusion in this project turned out to be **wrong** and had to
 be retracted.
 
@@ -113,6 +116,14 @@ disabled a feature (KV cache, two VRAM guards) instead of erroring.
 
 ---
 
+### 8. The transposed-copy kernel is ~30× slower than a blocked one
+
+`Fp8Weight` materialises each weight as a contiguous (in, out) tensor before the matmul —
+required, see finding 1. Doing that with `.t().contiguous()` runs the generic elementwise copy
+kernel at **~8 GB/s**; copying in blocks of rows gets **~114 GB/s**. Per 12288×4096 layer:
+31.5 ms → **2.73 ms**, and the fp8 render reproduces byte-identical output. Denoise steps get
+1.27–1.49× faster. NOTES.md §35.
+
 ## Results
 
 | config | steps | denoise | per step |
@@ -142,11 +153,16 @@ model fit at all next to a 2 GiB KV cache and activations.
 | `scripts/edit_qwen_image.py` | image editing (single / multi reference) |
 | `scripts/pipeline_common.py` | shared loading rules for the above |
 | `scripts/fp8_quant.py` | FP8 weight-only quantiser |
-| `scripts/fast_download.py` | multi-connection range downloader |
+| `scripts/fp8_checkpoint.py` | persists/reloads the quantised fp8 weights |
+| `scripts/fast_download.py` | multi-connection range downloader (any repo) |
+| `scripts/download_pe.sh` | fetch the prompt rewriter (18.84 GB) |
+| `scripts/pe_rewrite.py` | Qwen-Image-2.1-PE-T2I: request → prompt + aspect ratio |
+| `scripts/run_two_stage.py` | rewrite (CPU) then render (GPU, subprocess) |
+| `scripts/bench_pe_seqlen.py` | why the rewriter lives on the CPU, not the GPU |
 | `scripts/preflight.py` | model completeness + GPU usability check |
 | `scripts/validate_gpu.py` | 10-probe GPU validation |
 | `scripts/verify_checkpoint.py` | load real weights and run a forward pass |
-| `NOTES.md` | full technical record (33 sections, including retractions) |
+| `NOTES.md` | full technical record (38 sections, including retractions) |
 | `启动说明.md` | startup guide (Chinese) |
 | `AGENTS.md` | hard rules learned from failures |
 
@@ -206,6 +222,11 @@ $QIP_VENV/bin/python scripts/run_qwen_image.py \
     --prompt "a red apple on a wooden table" --output out.png
 ```
 
+The first run quantises the transformer (~41 s) and writes the result to
+`<model>/fp8-cache`; later runs restore the fp8 weights in ~2 s instead (byte-identical
+output). `--no-fp8-cache` forces a fresh quantise, `--fp8-cache DIR` moves the cache.
+NOTES.md §38.
+
 ### Persistent server (best for iterating on prompts)
 
 ```bash
@@ -228,6 +249,53 @@ $QIP_VENV/bin/python scripts/edit_qwen_image.py \
     --image input.png --prompt "Change the background to a sunset beach" \
     --output edited.png
 ```
+
+### Prompt rewriting — one sentence in, a detailed English prompt out
+
+`Qwen/Qwen-Image-2.1-PE-T2I` is the **prompt planner** that ships with Qwen-Image-2.1 (a
+fine-tuned Qwen3.5-VL 9B — not an image model). It turns a brief request in any language into
+the long English description the image model prefers, plus a recommended aspect ratio.
+
+```bash
+source scripts/env.sh
+
+# single command: rewrite, then render (stage 2 runs in its own process)
+$QIP_VENV/bin/python scripts/run_two_stage.py \
+    --prompt "一只在雨中弹吉他的柯基" --output pe_corgi.png
+```
+
+A rewrite is the expensive half on this box, so cache it and re-render for free:
+
+```bash
+# 1. rewrite once (~32 min on CPU) and keep the JSON
+$QIP_VENV/bin/python scripts/pe_rewrite.py --prompt "一只在雨中弹吉他的柯基" \
+    --no-thinking --max-new-tokens 512 --json-out logs/pe_rw1.json
+
+# 2. render it (~4 min on the GPU); reuses the cached rewrite
+$QIP_VENV/bin/python scripts/run_two_stage.py --prompt "一只在雨中弹吉他的柯基" \
+    --reuse-rw logs/pe_rw1.json --output pe_corgi.png
+
+# just the rewrite, no image
+$QIP_VENV/bin/python scripts/pe_rewrite.py --prompt "..." --with-size --print-thinking
+```
+
+Measured: `一只在雨中弹吉他的柯基` → **399-token English prompt + `wh_ratio: 3:2`** in 32 min
+(0.27 tok/s decode), then 1024×672 in **230 s** (20 steps, 6.33 s/step). Fetch the weights
+first with `bash scripts/download_pe.sh` (18.84 GB, into `./models`).
+
+Two things that are deliberately not the defaults:
+
+* **The rewriter runs on CPU**, and that is not a compromise — it is faster. The fp8 trick that
+  makes the image transformer fit was tried here: the weights fit (10.24 GiB) but a forward
+  pass costs 3–6 s *regardless of prompt length* (fp8→bf16 dequantisation per call, 248
+  layers), and the 2426-token system-prompt prefill does not fit in the ~2 GiB left at all
+  (`dxgkio_create_allocation: Ioctl failed: -12`). See NOTES.md section 34.
+* **`--no-thinking`** — the model card defaults to thinking on with `max_new_tokens=16256`,
+  which is 1.5–2 h on CPU. Off, a rewrite is 32 min and still produces the full JSON.
+
+The render sizes the card recommends (2048×2048 and up) are 4× the pixels this box can afford,
+so the ratio is honoured but the longest side is capped at `--max-side 1024`
+(`16:9 → 1024×576`, `2:3 → 688×1024`).
 
 ---
 

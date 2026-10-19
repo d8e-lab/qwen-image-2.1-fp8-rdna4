@@ -9,6 +9,25 @@
 
 ## If the GPU reports UNUSABLE, check in this order
 
+### 0. Is `/dev/dxg` even visible? (a sandbox can hide it)
+
+```bash
+ls -l /dev/dxg            # must exist, major:minor 10:258 on this box
+ls /dev | wc -l           # 6-8 entries = synthetic /dev, i.e. a sandbox
+```
+
+A restricted process sandbox mounts a **minimal synthetic `/dev`** (only `null`, `zero`,
+`random`, `urandom`, `tty`, `full`, `pts`, `shm`). Under it `/dev/dxg` and `/dev/dri` do not
+exist and `torch.cuda.init()` fails with `RuntimeError: No CUDA GPUs are available` — which
+looks exactly like a dead GPU. It is not: the host's `dxgkrnl` is loaded and
+`/sys/class/misc/dxg` (visible, because `/sys` comes from the host) still shows `10:258`.
+Measured here: with the sandbox's synthetic `/dev` the probe fails, and from a process with
+the real `/dev` the very same command prints `GPU OK - allocations work`.
+
+So before touching drivers or rebooting anything, compare `/dev/dxg` with `/sys/class/misc/dxg`.
+If the node is missing but the sysfs entry is present, the GPU is fine and the caller needs
+a less restricted sandbox — not a Windows reset.
+
 ### 1. Your own environment (most likely)
 
 ```bash

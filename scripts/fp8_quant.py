@@ -110,7 +110,8 @@ class Fp8Weight(nn.Module):
         """Return the weight materialised in ``dtype`` (bf16 by default), shape (out, in)."""
         return self.dequantize_transposed(dtype).t()
 
-    def dequantize_transposed(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    def dequantize_transposed(self, dtype: torch.dtype = torch.bfloat16,
+                              block: int = 256) -> torch.Tensor:
         """Return the weight materialised as a CONTIGUOUS (in, out) tensor.
 
         Layout matters enormously here. On this ROCm build a linear whose weight is a
@@ -128,15 +129,34 @@ class Fp8Weight(nn.Module):
         The fp32 multiply applies the per-row scale at full precision before the
         single narrowing cast; `q.float()` converts in-register (it is not a bit
         reinterpretation), which is what dequantisation needs.
+
+        The transpose itself is done in BLOCKS instead of `.t().contiguous()`.
+        A full 2-D transpose goes through the generic elementwise copy kernel: one
+        2-byte element per thread, source stride 12288*2 B, so a 32-thread warp touches
+        32 different rows and every fetched 32 B sector yields 2 useful bytes. Measured
+        on a 12288x4096 bf16 block (96 MiB) on this machine:
+
+            clone()  (already contiguous)    0.36 ms    ~260 GB/s
+            .t().contiguous()               24.9 ms      ~8 GB/s   <- wastes ~16x bandwidth
+            permute(1,0).contiguous()       29.6 ms      ~6 GB/s
+            blocked transpose (256 rows)     0.84 ms    ~114 GB/s   <- 30x faster
+
+        It is not a bf16 quirk - fp32 is just as bad (75.5 ms for the 192 MiB version) -
+        and the blocked form is bit-identical, because it is the same copy with the
+        source rows kept contiguous per block. On CPU it measures the same or better.
+        Whole-layer `Fp8Weight.forward`: 31.5 ms -> 2.7 ms.
         """
         if self._cache is not None and self._cache.dtype == dtype:
             return self._cache
         q = self.qweight.view(_E4M3)
-        # (out, in) -> transpose -> contiguous (in, out)
-        w = (q.float() * self.scale).to(dtype).t().contiguous()
+        w = (q.float() * self.scale).to(dtype)          # (out, in), contiguous
+        out_f, in_f = w.shape
+        w_t = torch.empty(in_f, out_f, dtype=dtype, device=w.device)
+        for i in range(0, out_f, block):
+            w_t[:, i:i + block] = w[i:i + block].t()
         if self.cache_dequant:
-            self._cache = w
-        return w
+            self._cache = w_t
+        return w_t
 
     def drop_cache(self) -> None:
         self._cache = None
